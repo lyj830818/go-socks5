@@ -2,7 +2,8 @@ package socks5
 
 import (
 	"bytes"
-	"encoding/binary"
+	"code.google.com/p/go.net/proxy"
+	// "encoding/binary"
 	"io"
 	"net"
 	"testing"
@@ -32,15 +33,15 @@ func TestSOCKS5_Connect(t *testing.T) {
 		}
 		conn.Write([]byte("pong"))
 	}()
-	lAddr := l.Addr().(*net.TCPAddr)
+	// lAddr := l.Addr().(*net.TCPAddr)
 
 	// Create a socks server
 	creds := StaticCredentials{
 		"foo": "bar",
 	}
-	cator := UserPassAuthenticator{Credentials : creds}
+	cator := UserPassAuthenticator{Credentials: creds}
 	conf := &Config{
-		AuthMethods : []Authenticator{cator},
+		AuthMethods: []Authenticator{cator, NoAuthAuthenticator{}},
 	}
 	serv, err := New(conf)
 	if err != nil {
@@ -55,53 +56,27 @@ func TestSOCKS5_Connect(t *testing.T) {
 	}()
 	time.Sleep(10 * time.Millisecond)
 
-	// Get a local conn
-	conn, err := net.Dial("tcp", "127.0.0.1:12365")
-	if err != nil {
-		t.Fatalf("err: %v", err)
+	auth := &proxy.Auth{"foo", "bar"}
+	dialer, e := proxy.SOCKS5("tcp", "127.0.0.1:12365", auth, proxy.Direct)
+	if e != nil {
+		t.Error(e)
 	}
 
-	// Connect, auth and connec to local
-	req := bytes.NewBuffer(nil)
-	req.Write([]byte{5})
-	req.Write([]byte{2, noAuth, userPassAuth})
-	req.Write([]byte{1, 3, 'f', 'o', 'o', 3, 'b', 'a', 'r'})
-	req.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1})
-
-	port := []byte{0, 0}
-	binary.BigEndian.PutUint16(port, uint16(lAddr.Port))
-	req.Write(port)
-
-	// Send a ping
-	req.Write([]byte("ping"))
-
-	// Send all the bytes
-	conn.Write(req.Bytes())
-
-	// Verify response
-	expected := []byte{
-		socks5Version, userPassAuth,
-		1, authSuccess,
-		5,
-		0,
-		0,
-		1,
-		127, 0, 0, 1,
-		0, 0,
-		'p', 'o', 'n', 'g',
+	conn, e := dialer.Dial("tcp", l.Addr().String())
+	if e != nil {
+		t.Error(e)
 	}
-	out := make([]byte, len(expected))
+
+	conn.Write([]byte("ping"))
+
+	out := make([]byte, 4)
 
 	conn.SetDeadline(time.Now().Add(time.Second))
-	if _, err := io.ReadAtLeast(conn, out, len(out)); err != nil {
+	if _, err := io.ReadFull(conn, out); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Ignore the port
-	out[12] = 0
-	out[13] = 0
-
-	if !bytes.Equal(out, expected) {
+	if !bytes.Equal(out, []byte("pong")) {
 		t.Fatalf("bad: %v", out)
 	}
 }

@@ -67,10 +67,11 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 		return fmt.Errorf("Failed to get command version: %v", err)
 	}
 
-	// Ensure we are compatible
-	if header[0] != socks5Version {
-		return fmt.Errorf("Unsupported command version: %v", header[0])
-	}
+	log.Println(header)
+	// // Ensure we are compatible
+	// if header[0] != socks5Version {
+	// 	return fmt.Errorf("Unsupported command version: %v", header[0])
+	// }
 
 	// Read in the destination address
 	dest, err := readAddrSpec(bufConn)
@@ -100,11 +101,32 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 	if s.config.Rewriter != nil {
 		realDest = s.config.Rewriter.Rewrite(dest)
 	}
+	log.Println(dest, realDest)
 
 	// Switch on the command
 	switch header[1] {
 	case connectCommand:
-		return s.handleConnect(conn, bufConn, dest, realDest)
+		if s.config.Dialer != nil {
+			c, e := s.config.Dialer.Dial("tcp", fmt.Sprintf("%s:%d", dest.IP.String(), dest.Port))
+			if e != nil {
+				log.Println(e)
+				return e
+			}
+			defer c.Close()
+
+			go func() {
+				_, e = io.Copy(c, bufConn)
+				if e != nil {
+					log.Println(e)
+				}
+			}()
+			_, e = io.Copy(conn, c)
+			if e != nil {
+				log.Println(e)
+			}
+		} else {
+			return s.handleConnect(conn, bufConn, dest, realDest)
+		}
 	case bindCommand:
 		return s.handleBind(conn, bufConn, dest, realDest)
 	case associateCommand:
@@ -115,6 +137,7 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 		}
 		return fmt.Errorf("Unsupported command: %v", header[1])
 	}
+	return nil
 }
 
 // handleConnect is used to handle a connect command
@@ -155,8 +178,8 @@ func (s *Server) handleConnect(conn conn, bufConn io.Reader, dest, realDest *Add
 
 	// Start proxying
 	errCh := make(chan error, 2)
-	go proxy("target", target, bufConn, errCh)
-	go proxy("client", conn, target, errCh)
+	go doProxy("target", target, bufConn, errCh)
+	go doProxy("client", conn, target, errCh)
 
 	// Wait
 	select {
@@ -301,7 +324,7 @@ func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
 
 // proxy is used to suffle data from src to destination, and sends errors
 // down a dedicated channel
-func proxy(name string, dst io.Writer, src io.Reader, errCh chan error) {
+func doProxy(name string, dst io.Writer, src io.Reader, errCh chan error) {
 	// Copy
 	n, err := io.Copy(dst, src)
 

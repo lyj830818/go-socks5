@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"bufio"
+	"code.google.com/p/go.net/proxy"
 	"fmt"
 	"log"
 	"net"
@@ -38,6 +39,8 @@ type Config struct {
 
 	// BindIP is used for bind or udp associate
 	BindIP net.IP
+
+	Dialer proxy.Dialer
 }
 
 // Server is reponsible for accepting connections and handling
@@ -96,6 +99,30 @@ func (s *Server) Serve(l net.Listener) error {
 		conn, err := l.Accept()
 		if err != nil {
 			return err
+		}
+		go s.ServeConn(conn)
+	}
+	return nil
+}
+
+// ListenAndServe is used to create a listener and serve on it
+func (s *Server) Listen(network, addr string) (net.Listener, error) {
+	l, err := net.Listen(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+// Serve is used to serve connections from a listener
+func (s *Server) ServeF(l net.Listener, fn func(addr net.Addr) bool) error {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		if !fn(conn.RemoteAddr()) {
+			return nil
 		}
 		go s.ServeConn(conn)
 	}
