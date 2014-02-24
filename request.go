@@ -68,10 +68,10 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 	}
 
 	log.Println(header)
-	// // Ensure we are compatible
-	// if header[0] != socks5Version {
-	// 	return fmt.Errorf("Unsupported command version: %v", header[0])
-	// }
+	// Ensure we are compatible
+	if header[0] != socks5Version {
+		return fmt.Errorf("Unsupported command version: %v", header[0])
+	}
 
 	// Read in the destination address
 	dest, err := readAddrSpec(bufConn)
@@ -101,12 +101,11 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 	if s.config.Rewriter != nil {
 		realDest = s.config.Rewriter.Rewrite(dest)
 	}
-	log.Println(dest, realDest)
-
 	// Switch on the command
 	switch header[1] {
 	case connectCommand:
 		if s.config.Dialer != nil {
+			log.Println("go here4")
 			c, e := s.config.Dialer.Dial("tcp", fmt.Sprintf("%s:%d", dest.IP.String(), dest.Port))
 			if e != nil {
 				log.Println(e)
@@ -124,14 +123,19 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 			if e != nil {
 				log.Println(e)
 			}
+
 		} else {
+			log.Println("go here3")
 			return s.handleConnect(conn, bufConn, dest, realDest)
 		}
 	case bindCommand:
+		log.Println("go here0")
 		return s.handleBind(conn, bufConn, dest, realDest)
 	case associateCommand:
+		log.Println("go here1")
 		return s.handleAssociate(conn, bufConn, dest, realDest)
 	default:
+		log.Println("go here2")
 		if err := sendReply(conn, commandNotSupported, nil); err != nil {
 			return fmt.Errorf("Failed to send reply: %v", err)
 		}
@@ -209,19 +213,122 @@ func (s *Server) handleBind(conn conn, bufConn io.Reader, dest, realDest *AddrSp
 // handleAssociate is used to handle a connect command
 func (s *Server) handleAssociate(conn conn, bufConn io.Reader, dest, realDest *AddrSpec) error {
 	// Check if this is allowed
-	client := conn.RemoteAddr().(*net.TCPAddr)
-	if !s.config.Rules.AllowAssociate(realDest.IP, realDest.Port, client.IP, client.Port) {
-		if err := sendReply(conn, ruleFailure, nil); err != nil {
-			return fmt.Errorf("Failed to send reply: %v", err)
-		}
-		return fmt.Errorf("Associate to %v blocked by rules", dest)
-	}
+	// client := conn.RemoteAddr().(*net.TCPAddr)
+	// if !s.config.Rules.AllowAssociate(realDest.IP, realDest.Port, client.IP, client.Port) {
+	// 	if err := sendReply(conn, ruleFailure, nil); err != nil {
+	// 		return fmt.Errorf("Failed to send reply: %v", err)
+	// 	}
+	// 	return fmt.Errorf("Associate to %v blocked by rules", dest)
+	// }
 
-	// TODO: Support associate
-	if err := sendReply(conn, commandNotSupported, nil); err != nil {
+	// addr := &net.UDPAddr{IP: realDest.IP, Port: realDest.Port}
+
+	// create a udp server
+	l, e := net.ListenPacket("udp", "localhost:0")
+	if e != nil {
+		log.Println(e)
+		return e
+	}
+	defer l.Close()
+
+	local := l.LocalAddr().(*net.UDPAddr)
+
+	// Send success
+	bind := AddrSpec{IP: local.IP.To4(), Port: local.Port}
+	if err := sendReply(conn, successReply, &bind); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
+
+	dest, err := readAddrSpec2(l)
+	if err != nil {
+		if err == unrecognizedAddrType {
+			if err := sendReply(conn, addrTypeNotSupported, nil); err != nil {
+				return fmt.Errorf("Failed to send reply: %v", err)
+			}
+		}
+		return fmt.Errorf("Failed to read destination address: %v", err)
+	}
+
+	// Apply any address rewrites
+	realDest = dest
+	if s.config.Rewriter != nil {
+		realDest = s.config.Rewriter.Rewrite(dest)
+	}
+
+	raddr := &net.UDPAddr{IP: realDest.IP, Port: realDest.Port}
+	target, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		msg := err.Error()
+		resp := hostUnreachable
+		if strings.Contains(msg, "refused") {
+			resp = connectionRefused
+		} else if strings.Contains(msg, "network is unreachable") {
+			resp = networkUnreachable
+		}
+		if err := sendReply(conn, resp, nil); err != nil {
+			return fmt.Errorf("Failed to send reply: %v", err)
+		}
+		return fmt.Errorf("Connect to %v failed: %v", dest, err)
+	}
+
+	defer target.Close()
+
+	ludp, ok := l.(*net.UDPConn)
+	if !ok {
+		log.Println("XXXXXXXXXXXXXX")
+		return nil
+	}
+	doProxy2(ludp, target)
 	return nil
+}
+
+func readAddrSpec2(l net.PacketConn) (*AddrSpec, error) {
+	d := &AddrSpec{}
+
+	buf := []byte{0, 0, 0, 0}
+	_, _, e := l.ReadFrom(buf)
+	if e != nil {
+		return nil, e
+	}
+	switch buf[4] {
+	case ipv4Address:
+		addrbuf := make([]byte, 4)
+		_, _, e = l.ReadFrom(addrbuf)
+		if e != nil {
+			return nil, e
+		}
+		d.IP = net.IP(addrbuf)
+
+	case ipv6Address:
+		addrbuf := make([]byte, 16)
+		_, _, e = l.ReadFrom(addrbuf)
+		if e != nil {
+			return nil, e
+		}
+		d.IP = net.IP(addrbuf)
+
+	case fqdnAddress:
+		_, _, e = l.ReadFrom(buf[:0])
+		if e != nil {
+			return nil, e
+		}
+		addrLen := int(buf[0])
+		fqdn := make([]byte, addrLen)
+		_, _, e = l.ReadFrom(fqdn)
+		if e != nil {
+			return nil, e
+		}
+		d.FQDN = string(fqdn)
+
+	default:
+		return nil, unrecognizedAddrType
+	}
+	// Read the port
+	port := []byte{0, 0}
+	_, _, e = l.ReadFrom(port)
+	d.Port = (int(port[0]) << 8) | int(port[1])
+
+	return d, nil
 }
 
 // readAddrSpec is used to read AddrSpec.
@@ -335,4 +442,28 @@ func doProxy(name string, dst io.Writer, src io.Reader, errCh chan error) {
 
 	// Send any errors
 	errCh <- err
+}
+
+func doProxy2(l, t *net.UDPConn) {
+	g := func(c1, c2 net.PacketConn) {
+		defer c1.Close()
+		defer c2.Close()
+		buf := make([]byte, 1500)
+		for {
+			n, _, e := c1.ReadFrom(buf)
+			if e != nil {
+				l.Close()
+				return
+			}
+			_, e = c2.WriteTo(buf[:n], t.RemoteAddr())
+			if e != nil {
+				t.Close()
+				return
+			}
+		}
+	}
+	go func() {
+		g(l, t)
+	}()
+	g(t, l)
 }
