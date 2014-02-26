@@ -47,10 +47,10 @@ type AddrSpec struct {
 	Port int
 }
 
-type conn interface {
-	Write([]byte) (int, error)
-	RemoteAddr() net.Addr
-}
+// type conn interface {
+// 	Write([]byte) (int, error)
+// 	RemoteAddr() net.Addr
+// }
 
 func (a *AddrSpec) String() string {
 	if a.FQDN != "" {
@@ -60,21 +60,20 @@ func (a *AddrSpec) String() string {
 }
 
 // handleRequest is used for request processing after authentication
-func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
+func (s *Server) handleRequest(conn net.Conn) error {
 	// Read the version byte
 	header := []byte{0, 0, 0}
-	if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
+	if _, err := io.ReadAtLeast(conn, header, 3); err != nil {
 		return fmt.Errorf("Failed to get command version: %v", err)
 	}
 
-	log.Println(header)
 	// Ensure we are compatible
 	if header[0] != socks5Version {
 		return fmt.Errorf("Unsupported command version: %v", header[0])
 	}
 
 	// Read in the destination address
-	dest, err := readAddrSpec(bufConn)
+	dest, err := readAddrSpec(conn)
 	if err != nil {
 		if err == unrecognizedAddrType {
 			if err := sendReply(conn, addrTypeNotSupported, nil); err != nil {
@@ -104,38 +103,12 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 	// Switch on the command
 	switch header[1] {
 	case connectCommand:
-		if s.config.Dialer != nil {
-			log.Println("go here4")
-			c, e := s.config.Dialer.Dial("tcp", fmt.Sprintf("%s:%d", dest.IP.String(), dest.Port))
-			if e != nil {
-				log.Println(e)
-				return e
-			}
-			defer c.Close()
-
-			go func() {
-				_, e = io.Copy(c, bufConn)
-				if e != nil {
-					log.Println(e)
-				}
-			}()
-			_, e = io.Copy(conn, c)
-			if e != nil {
-				log.Println(e)
-			}
-
-		} else {
-			log.Println("go here3")
-			return s.handleConnect(conn, bufConn, dest, realDest)
-		}
+		return s.handleConnect(conn, dest, realDest)
 	case bindCommand:
-		log.Println("go here0")
-		return s.handleBind(conn, bufConn, dest, realDest)
+		return s.handleBind(conn, dest, realDest)
 	case associateCommand:
-		log.Println("go here1")
-		return s.handleAssociate(conn, bufConn, dest, realDest)
+		return s.handleAssociate(conn, dest, realDest)
 	default:
-		log.Println("go here2")
 		if err := sendReply(conn, commandNotSupported, nil); err != nil {
 			return fmt.Errorf("Failed to send reply: %v", err)
 		}
@@ -145,7 +118,7 @@ func (s *Server) handleRequest(conn conn, bufConn io.Reader) error {
 }
 
 // handleConnect is used to handle a connect command
-func (s *Server) handleConnect(conn conn, bufConn io.Reader, dest, realDest *AddrSpec) error {
+func (s *Server) handleConnect(conn net.Conn, dest, realDest *AddrSpec) error {
 	// Check if this is allowed
 	client := conn.RemoteAddr().(*net.TCPAddr)
 	if !s.config.Rules.AllowConnect(realDest.IP, realDest.Port, client.IP, client.Port) {
@@ -155,9 +128,15 @@ func (s *Server) handleConnect(conn conn, bufConn io.Reader, dest, realDest *Add
 		return fmt.Errorf("Connect to %v blocked by rules", dest)
 	}
 
-	// Attempt to connect
-	addr := net.TCPAddr{IP: realDest.IP, Port: realDest.Port}
-	target, err := net.DialTCP("tcp", nil, &addr)
+	var target net.Conn
+	var err error
+	if s.config.Dialer != nil {
+		target, err = s.config.Dialer.Dial("tcp", fmt.Sprintf("%s:%d", dest.IP.String(), dest.Port))
+	} else {
+		// Attempt to connect
+		addr := net.TCPAddr{IP: realDest.IP, Port: realDest.Port}
+		target, err = net.DialTCP("tcp", nil, &addr)
+	}
 	if err != nil {
 		msg := err.Error()
 		resp := hostUnreachable
@@ -180,20 +159,11 @@ func (s *Server) handleConnect(conn conn, bufConn io.Reader, dest, realDest *Add
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
 
-	// Start proxying
-	errCh := make(chan error, 2)
-	go doProxy("target", target, bufConn, errCh)
-	go doProxy("client", conn, target, errCh)
-
-	// Wait
-	select {
-	case e := <-errCh:
-		return e
-	}
+	return doProxy2(target, conn)
 }
 
 // handleBind is used to handle a connect command
-func (s *Server) handleBind(conn conn, bufConn io.Reader, dest, realDest *AddrSpec) error {
+func (s *Server) handleBind(conn net.Conn, dest, realDest *AddrSpec) error {
 	// Check if this is allowed
 	client := conn.RemoteAddr().(*net.TCPAddr)
 	if !s.config.Rules.AllowBind(realDest.IP, realDest.Port, client.IP, client.Port) {
@@ -211,27 +181,17 @@ func (s *Server) handleBind(conn conn, bufConn io.Reader, dest, realDest *AddrSp
 }
 
 // handleAssociate is used to handle a connect command
-func (s *Server) handleAssociate(conn conn, bufConn io.Reader, dest, realDest *AddrSpec) error {
-	// Check if this is allowed
-	// client := conn.RemoteAddr().(*net.TCPAddr)
-	// if !s.config.Rules.AllowAssociate(realDest.IP, realDest.Port, client.IP, client.Port) {
-	// 	if err := sendReply(conn, ruleFailure, nil); err != nil {
-	// 		return fmt.Errorf("Failed to send reply: %v", err)
-	// 	}
-	// 	return fmt.Errorf("Associate to %v blocked by rules", dest)
-	// }
-
-	// addr := &net.UDPAddr{IP: realDest.IP, Port: realDest.Port}
-
+func (s *Server) handleAssociate(conn net.Conn, dest, realDest *AddrSpec) error {
 	// create a udp server
-	l, e := net.ListenPacket("udp", "localhost:0")
-	if e != nil {
-		log.Println(e)
-		return e
+	udpAddr := &net.UDPAddr{IP: conn.LocalAddr().(*net.TCPAddr).IP, Port: 0}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Println(err)
+		return err
 	}
-	defer l.Close()
+	defer udpConn.Close()
 
-	local := l.LocalAddr().(*net.UDPAddr)
+	local := udpConn.LocalAddr().(*net.UDPAddr)
 
 	// Send success
 	bind := AddrSpec{IP: local.IP.To4(), Port: local.Port}
@@ -239,7 +199,13 @@ func (s *Server) handleAssociate(conn conn, bufConn io.Reader, dest, realDest *A
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
 
-	dest, err := readAddrSpec2(l)
+	b := make([]byte, 3)
+	_, err = io.ReadAtLeast(udpConn, b, len(b))
+	if err != nil {
+		log.Println("io.ReadFull(udpConn, buf)", err)
+		return err
+	}
+	dest, err = readAddrSpec(udpConn)
 	if err != nil {
 		if err == unrecognizedAddrType {
 			if err := sendReply(conn, addrTypeNotSupported, nil); err != nil {
@@ -273,62 +239,7 @@ func (s *Server) handleAssociate(conn conn, bufConn io.Reader, dest, realDest *A
 
 	defer target.Close()
 
-	ludp, ok := l.(*net.UDPConn)
-	if !ok {
-		log.Println("XXXXXXXXXXXXXX")
-		return nil
-	}
-	doProxy2(ludp, target)
-	return nil
-}
-
-func readAddrSpec2(l net.PacketConn) (*AddrSpec, error) {
-	d := &AddrSpec{}
-
-	buf := []byte{0, 0, 0, 0}
-	_, _, e := l.ReadFrom(buf)
-	if e != nil {
-		return nil, e
-	}
-	switch buf[4] {
-	case ipv4Address:
-		addrbuf := make([]byte, 4)
-		_, _, e = l.ReadFrom(addrbuf)
-		if e != nil {
-			return nil, e
-		}
-		d.IP = net.IP(addrbuf)
-
-	case ipv6Address:
-		addrbuf := make([]byte, 16)
-		_, _, e = l.ReadFrom(addrbuf)
-		if e != nil {
-			return nil, e
-		}
-		d.IP = net.IP(addrbuf)
-
-	case fqdnAddress:
-		_, _, e = l.ReadFrom(buf[:0])
-		if e != nil {
-			return nil, e
-		}
-		addrLen := int(buf[0])
-		fqdn := make([]byte, addrLen)
-		_, _, e = l.ReadFrom(fqdn)
-		if e != nil {
-			return nil, e
-		}
-		d.FQDN = string(fqdn)
-
-	default:
-		return nil, unrecognizedAddrType
-	}
-	// Read the port
-	port := []byte{0, 0}
-	_, _, e = l.ReadFrom(port)
-	d.Port = (int(port[0]) << 8) | int(port[1])
-
-	return d, nil
+	return doProxy2(target, udpConn)
 }
 
 // readAddrSpec is used to read AddrSpec.
@@ -433,37 +344,77 @@ func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
 // down a dedicated channel
 func doProxy(name string, dst io.Writer, src io.Reader, errCh chan error) {
 	// Copy
-	n, err := io.Copy(dst, src)
-
-	// Log, and sleep. This is jank but allows the otherside
-	// to finish a pending copy
-	log.Printf("[DEBUG] socks: Copied %d bytes to %s", n, name)
+	p := make([]byte, 16)
+	n, err := src.Read(p)
+	if err != nil {
+		log.Println(err)
+		errCh <- err
+		return
+	}
+	dst.Write(p)
+	// n, err := io.Copy(dst, src)
+	log.Println(name, n, err)
 	time.Sleep(10 * time.Millisecond)
-
 	// Send any errors
 	errCh <- err
 }
 
-func doProxy2(l, t *net.UDPConn) {
-	g := func(c1, c2 net.PacketConn) {
-		defer c1.Close()
-		defer c2.Close()
-		buf := make([]byte, 1500)
-		for {
-			n, _, e := c1.ReadFrom(buf)
-			if e != nil {
-				l.Close()
-				return
-			}
-			_, e = c2.WriteTo(buf[:n], t.RemoteAddr())
-			if e != nil {
-				t.Close()
-				return
-			}
-		}
+func doProxy2(l, r net.Conn) error {
+	f := func(c1, c2 net.Conn) {
+		io.Copy(c1, c2)
 	}
 	go func() {
-		g(l, t)
+		f(l, r)
 	}()
-	g(t, l)
+	f(r, l)
+	return nil
+}
+
+func readAddrSpec2(l net.PacketConn) (*AddrSpec, error) {
+	d := &AddrSpec{}
+
+	buf := []byte{0, 0, 0, 0}
+	_, _, e := l.ReadFrom(buf)
+	if e != nil {
+		return nil, e
+	}
+	switch buf[4] {
+	case ipv4Address:
+		addrbuf := make([]byte, 4)
+		_, _, e = l.ReadFrom(addrbuf)
+		if e != nil {
+			return nil, e
+		}
+		d.IP = net.IP(addrbuf)
+
+	case ipv6Address:
+		addrbuf := make([]byte, 16)
+		_, _, e = l.ReadFrom(addrbuf)
+		if e != nil {
+			return nil, e
+		}
+		d.IP = net.IP(addrbuf)
+
+	case fqdnAddress:
+		_, _, e = l.ReadFrom(buf[:0])
+		if e != nil {
+			return nil, e
+		}
+		addrLen := int(buf[0])
+		fqdn := make([]byte, addrLen)
+		_, _, e = l.ReadFrom(fqdn)
+		if e != nil {
+			return nil, e
+		}
+		d.FQDN = string(fqdn)
+
+	default:
+		return nil, unrecognizedAddrType
+	}
+	// Read the port
+	port := []byte{0, 0}
+	_, _, e = l.ReadFrom(port)
+	d.Port = (int(port[0]) << 8) | int(port[1])
+
+	return d, nil
 }

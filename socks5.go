@@ -1,7 +1,7 @@
 package socks5
 
 import (
-	"bufio"
+	// "bufio"
 	"code.google.com/p/go.net/proxy"
 	"fmt"
 	"log"
@@ -132,11 +132,11 @@ func (s *Server) ServeF(l net.Listener, fn func(addr net.Addr) bool) error {
 // ServeConn is used to serve a single connection.
 func (s *Server) ServeConn(conn net.Conn) error {
 	defer conn.Close()
-	bufConn := bufio.NewReader(conn)
+	// bufConn := bufio.NewReader(conn)
 
 	// Read the version byte
 	version := []byte{0}
-	if _, err := bufConn.Read(version); err != nil {
+	if _, err := conn.Read(version); err != nil {
 		log.Printf("[ERR] socks: Failed to get version byte: %v", err)
 		return err
 	}
@@ -149,14 +149,14 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	}
 
 	// Authenticate the connection
-	if err := s.authenticate(conn, bufConn); err != nil {
+	if err := s.authenticate(conn); err != nil {
 		err = fmt.Errorf("Failed to authenticate: %v", err)
 		log.Printf("[ERR] socks: %v", err)
 		return err
 	}
 
 	// Process the client request
-	if err := s.handleRequest(conn, bufConn); err != nil {
+	if err := s.handleRequest(conn); err != nil {
 		err = fmt.Errorf("Failed to handle request: %v", err)
 		log.Printf("[ERR] socks: %v", err)
 		return err

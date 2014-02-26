@@ -3,6 +3,7 @@ package socks5
 import (
 	"fmt"
 	"io"
+	"net"
 )
 
 const (
@@ -25,7 +26,7 @@ type Authenticator interface {
 }
 
 // NoAuthAuthenticator is used to handle the "No Authentication" mode
-type NoAuthAuthenticator struct {}
+type NoAuthAuthenticator struct{}
 
 func (a NoAuthAuthenticator) GetCode() uint8 {
 	return noAuth
@@ -99,12 +100,10 @@ func (a UserPassAuthenticator) Authenticate(reader io.Reader, writer io.Writer) 
 
 }
 
-
-
 // authenticate is used to handle connection authentication
-func (s *Server) authenticate(conn io.Writer, bufConn io.Reader) error {
+func (s *Server) authenticate(conn net.Conn) error {
 	// Get the methods
-	methods, err := readMethods(bufConn)
+	methods, err := readMethods(conn)
 	if err != nil {
 		return fmt.Errorf("Failed to get auth methods: %v", err)
 	}
@@ -113,15 +112,13 @@ func (s *Server) authenticate(conn io.Writer, bufConn io.Reader) error {
 	for _, method := range methods {
 		cator, found := s.authMethods[method]
 		if found {
-			return cator.Authenticate(bufConn, conn)
+			return cator.Authenticate(conn, conn)
 		}
 	}
 
 	// No usable method found
 	return noAcceptableAuth(conn)
 }
-
-
 
 // noAcceptableAuth is used to handle when we have no eligible
 // authentication mechanism
